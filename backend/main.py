@@ -247,6 +247,50 @@ def _historical_success(quest: Quest, history: list[QuestHistory]) -> float:
     return completed / len(same)
 
 
+def _is_repetitive(db: Session, quest: Quest) -> bool:
+    """
+    Reject only genuinely repeated quests.
+
+    A quest is considered repetitive when:
+    1. Its title exactly matches a recent quest, OR
+    2. Its overall quest text is extremely similar to a recent quest.
+
+    Category repetition alone is NOT a rejection.
+    This prevents SIDEQUEST from getting stuck after a few quests.
+    """
+    recent = _recent_history(db, 10)
+    new_text = _normalise(_quest_text(quest))
+
+    for record in recent:
+        old_text = _normalise(
+            " ".join(
+                [
+                    record.title,
+                    record.objective,
+                    record.category,
+                    *_loads(record.steps, []),
+                ]
+            )
+        )
+
+        # Exact same title = definitely repeated.
+        if _normalise(record.title) == _normalise(quest.title):
+            return True
+
+        # Only reject very high textual similarity.
+        # 0.82 is intentionally less aggressive than the old 0.72 threshold.
+        similarity = SequenceMatcher(
+            None,
+            old_text,
+            new_text,
+        ).ratio()
+
+        if similarity >= 0.82:
+            return True
+
+    return False
+
+
 def _rank_quest(
     quest: Quest,
     *,
@@ -255,12 +299,38 @@ def _rank_quest(
     profile_data: dict,
     history: list[QuestHistory],
 ) -> float:
-    time_fit = _time_score(quest.duration_minutes, time_available)
-    preference = _preference_score(quest, profile_data, interests)
+    """
+    Deterministically rank a safe candidate.
+
+    Recent categories receive a small penalty rather than being rejected.
+    This encourages variety while still allowing a good quest to be selected.
+    """
+    time_fit = _time_score(
+        quest.duration_minutes,
+        time_available,
+    )
+
+    preference = _preference_score(
+        quest,
+        profile_data,
+        interests,
+    )
+
     novelty = quest.novelty_score
-    feasibility = 1.0 if quest.duration_minutes <= time_available else 0.0
+
+    feasibility = (
+        1.0
+        if quest.duration_minutes <= time_available
+        else 0.0
+    )
+
+    # Route awareness is not implemented yet, so keep a neutral value.
     route_compatibility = 0.5
-    historical_success = _historical_success(quest, history)
+
+    historical_success = _historical_success(
+        quest,
+        history,
+    )
 
     score = (
         0.25 * time_fit
@@ -271,16 +341,19 @@ def _rank_quest(
         + 0.10 * historical_success
     )
 
-    if _is_repetitive_score(db=None, quest=quest):
-        score -= 0.15
+    # Encourage category diversity without blocking valid quests.
+    recent_categories = [
+        record.category.lower()
+        for record in history[:3]
+    ]
 
-    return max(0.0, min(1.0, score))
+    if quest.category.lower() in recent_categories:
+        score -= 0.08
 
-
-def _is_repetitive_score(db, quest: Quest) -> bool:
-    # Placeholder used only to keep ranking deterministic; actual repetition is
-    # checked against the database before selection.
-    return False
+    return max(
+        0.0,
+        min(1.0, score),
+    )
 
 
 async def _generate_candidates(
