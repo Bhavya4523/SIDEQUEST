@@ -163,13 +163,18 @@ that fits naturally into the user's journey.
             "quest": selected.model_dump(),
         }
 
-    except Exception:
-        return {
-            "error": (
-                "Local AI is unavailable right now. "
-                "Make sure Ollama is running and try again."
-            )
-        }
+    except Exception as exc:
+     print(
+        f"SIDEQUEST AI generation failed: "
+        f"{type(exc).__name__}: {exc}",
+        flush=True,
+    )
+    return {
+        "error": (
+            "Sidequest generation failed. "
+            "Please try again."
+        )
+    }
 
 
 @app.post("/generate-candidates")
@@ -485,15 +490,18 @@ Requirements:
             "score": selected_score,
             "quest": selected.model_dump(),
         }
-
-    except Exception:
-        return {
-            "error": (
-                "Local AI is unavailable right now. "
-                "Make sure Ollama is running and try again."
-            )
-        }
-
+    except Exception as exc:
+     print(
+        f"SIDEQUEST AI generation failed: "
+        f"{type(exc).__name__}: {exc}",
+        flush=True,
+    )
+    return {
+        "error": (
+            "Sidequest generation failed. "
+            "Please try again."
+        )
+    }
 
 @app.post("/check-repetition")
 def check_quest_repetition(
