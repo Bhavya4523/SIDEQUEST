@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
-const API_URL = "http://127.0.0.1:8000";
+const API_URL = import.meta.env.VITE_API_URL || "/api";
 
 const moods = [
   "bored",
@@ -42,11 +42,11 @@ function LocalStatus({ isOnline }) {
     <div className="local-status-group">
       <div className="topbar-status">
         <span className="status-dot" />
-        {isOnline ? "LOCAL AI" : "NETWORK OFF"}
+        {isOnline ? "OPEN-WEIGHT AI" : "NETWORK OFF"}
       </div>
 
       <span className="local-status-sub">
-        {isOnline ? "ON DEVICE" : "LOCAL AI READY"}
+        {isOnline ? "ON DEVICE" : "OPEN-WEIGHT AI READY"}
       </span>
     </div>
   );
@@ -979,7 +979,7 @@ function App() {
           <div className="field-note">
             FIELD NOTE 001
             <span />
-            LOCAL AI
+            OPEN-WEIGHT AI
           </div>
 
           <p className="eyebrow">
@@ -1036,8 +1036,8 @@ function App() {
 
             <span>
               {isOnline
-                ? "LOCAL AI · ON DEVICE"
-                : "NETWORK OFF · LOCAL AI STILL READY"}
+                ? "OPEN-WEIGHT AI · ON DEVICE"
+                : "NETWORK OFF · OPEN-WEIGHT STILL READY"}
             </span>
           </div>
 
@@ -1187,7 +1187,7 @@ function App() {
       </section>
 
       <footer>
-        <span>LOCAL AI · PRIVATE BY DEFAULT</span>
+        <span>OPEN-WEIGHT · PRIVATE BY DEFAULT</span>
         <span>THE WORLD IS OUTSIDE</span>
       </footer>
     </main>
@@ -1195,3 +1195,4 @@ function App() {
 }
 
 export default App;
+
