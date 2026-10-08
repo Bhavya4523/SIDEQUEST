@@ -271,7 +271,8 @@ Include every required field.
         except Exception as exc:
             last_error = exc
 
-raise RuntimeError(
+            raise RuntimeError(
     "AI generation failed after retry: "
     f"{type(last_error).__name__}: {last_error}"
 ) from last_error
+
