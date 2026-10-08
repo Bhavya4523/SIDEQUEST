@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 
 from backend.anti_repetition import check_repetition
 from backend.candidate_service import generate_candidates
-from backend.database import get_db
+from backend.database import get_db,Base, engine
+from backend import models
 from backend.models import QuestHistory
 from backend.ollama_service import generate_quest
 from backend.personalization import (
@@ -28,6 +29,7 @@ app = FastAPI(
     description="Local-first AI sidequest generator",
     version="0.1.0",
 )
+Base.metadata.create_all(bind=engine)
 
 
 app.add_middleware(
