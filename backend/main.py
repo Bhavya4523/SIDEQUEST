@@ -312,8 +312,16 @@ async def _generate_candidates(
         )
 
         try:
-            quest = await generate_quest(prompt, temperature=0.7 if count > 1 else 0.5)
-        except Exception:
+            quest = await generate_quest(
+                prompt,
+                temperature=0.7 if count > 1 else 0.5,
+            )
+        except Exception as exc:
+            print(
+                f"SIDEQUEST candidate {index + 1} failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
             continue
 
         safe, _ = _is_safe(quest)
