@@ -4,13 +4,13 @@ import re
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from backend.database import Base, engine, get_db
-from backend.models import QuestHistory, UserProfile
+from backend.models import QuestHistory
 from backend.ollama_service import (
     AI_MODE,
     HF_MODEL,
@@ -23,6 +23,33 @@ from backend.schemas import ChaosRequest, Quest, QuestFeedback, QuestRequest
 
 # Render starts with a fresh SQLite database. Create all tables at startup.
 Base.metadata.create_all(bind=engine)
+
+
+def _init_user_tables() -> None:
+    """Create anonymous-user tables without changing the existing schema."""
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS sidequest_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL UNIQUE,
+                category_preferences TEXT NOT NULL DEFAULT '{}',
+                preferred_duration INTEGER NOT NULL DEFAULT 20,
+                preferred_difficulty TEXT NOT NULL DEFAULT 'easy',
+                novelty_preference REAL NOT NULL DEFAULT 0.70
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS sidequest_user_quests (
+                user_id INTEGER NOT NULL,
+                quest_id INTEGER NOT NULL UNIQUE,
+                PRIMARY KEY (user_id, quest_id),
+                FOREIGN KEY(user_id) REFERENCES sidequest_users(id),
+                FOREIGN KEY(quest_id) REFERENCES quest_history(id)
+            )
+        """))
+
+
+_init_user_tables()
 
 app = FastAPI(title="SIDEQUEST API", version="1.0.0")
 
@@ -113,36 +140,83 @@ def _is_safe(quest: Quest) -> tuple[bool, str | None]:
     return True, None
 
 
-def _profile(db: Session) -> UserProfile:
-    profile = db.query(UserProfile).first()
-    if profile is None:
-        profile = UserProfile()
-        db.add(profile)
+def _client_id(value: str | None) -> str:
+    """Normalize the anonymous browser identifier."""
+    value = (value or "").strip()
+    return value[:128] if value else "api-anonymous"
+
+
+def _ensure_user(db: Session, client_id: str):
+    client_id = _client_id(client_id)
+    row = db.execute(
+        text(
+            "SELECT id, client_id, category_preferences, preferred_duration, "
+            "preferred_difficulty, novelty_preference "
+            "FROM sidequest_users WHERE client_id = :client_id"
+        ),
+        {"client_id": client_id},
+    ).mappings().first()
+
+    if row is None:
+        db.execute(
+            text(
+                "INSERT INTO sidequest_users "
+                "(client_id, category_preferences, preferred_duration, "
+                "preferred_difficulty, novelty_preference) "
+                "VALUES (:client_id, '{}', 20, 'easy', 0.70)"
+            ),
+            {"client_id": client_id},
+        )
         db.commit()
-        db.refresh(profile)
-    return profile
+        row = db.execute(
+            text(
+                "SELECT id, client_id, category_preferences, preferred_duration, "
+                "preferred_difficulty, novelty_preference "
+                "FROM sidequest_users WHERE client_id = :client_id"
+            ),
+            {"client_id": client_id},
+        ).mappings().first()
+
+    return row
 
 
-def _profile_data(profile: UserProfile) -> dict:
+def _profile_data(db: Session, client_id: str) -> dict:
+    user = _ensure_user(db, client_id)
     return {
-        "category_preferences": _loads(profile.category_preferences, {}),
-        "preferred_duration": profile.preferred_duration,
-        "preferred_difficulty": profile.preferred_difficulty,
-        "novelty_preference": profile.novelty_preference,
+        "category_preferences": _loads(user["category_preferences"], {}),
+        "preferred_duration": user["preferred_duration"],
+        "preferred_difficulty": user["preferred_difficulty"],
+        "novelty_preference": user["novelty_preference"],
     }
 
 
-def _recent_history(db: Session, limit: int = 10) -> list[QuestHistory]:
+def _recent_history(
+    db: Session,
+    client_id: str,
+    limit: int = 10,
+) -> list[QuestHistory]:
+    user = _ensure_user(db, client_id)
+    quest_ids = db.execute(
+        text(
+            "SELECT quest_id FROM sidequest_user_quests "
+            "WHERE user_id = :user_id ORDER BY quest_id DESC LIMIT :limit"
+        ),
+        {"user_id": user["id"], "limit": limit},
+    ).scalars().all()
+
+    if not quest_ids:
+        return []
+
     return (
         db.query(QuestHistory)
+        .filter(QuestHistory.id.in_(quest_ids))
         .order_by(QuestHistory.created_at.desc(), QuestHistory.id.desc())
-        .limit(limit)
         .all()
     )
 
 
-def _is_repetitive(db: Session, quest: Quest) -> bool:
-    recent = _recent_history(db, 10)
+def _is_repetitive(db: Session, client_id: str, quest: Quest) -> bool:
+    recent = _recent_history(db, client_id, 10)
     new_text = _normalise(_quest_text(quest))
 
     for record in recent:
@@ -161,12 +235,8 @@ def _is_repetitive(db: Session, quest: Quest) -> bool:
             return True
 
         similarity = SequenceMatcher(None, old_text, new_text).ratio()
-        if similarity >= 0.72:
+        if similarity >= 0.82:
             return True
-
-    categories = [record.category for record in recent[:3]]
-    if quest.category in categories:
-        return True
 
     return False
 
@@ -247,50 +317,6 @@ def _historical_success(quest: Quest, history: list[QuestHistory]) -> float:
     return completed / len(same)
 
 
-def _is_repetitive(db: Session, quest: Quest) -> bool:
-    """
-    Reject only genuinely repeated quests.
-
-    A quest is considered repetitive when:
-    1. Its title exactly matches a recent quest, OR
-    2. Its overall quest text is extremely similar to a recent quest.
-
-    Category repetition alone is NOT a rejection.
-    This prevents SIDEQUEST from getting stuck after a few quests.
-    """
-    recent = _recent_history(db, 10)
-    new_text = _normalise(_quest_text(quest))
-
-    for record in recent:
-        old_text = _normalise(
-            " ".join(
-                [
-                    record.title,
-                    record.objective,
-                    record.category,
-                    *_loads(record.steps, []),
-                ]
-            )
-        )
-
-        # Exact same title = definitely repeated.
-        if _normalise(record.title) == _normalise(quest.title):
-            return True
-
-        # Only reject very high textual similarity.
-        # 0.82 is intentionally less aggressive than the old 0.72 threshold.
-        similarity = SequenceMatcher(
-            None,
-            old_text,
-            new_text,
-        ).ratio()
-
-        if similarity >= 0.82:
-            return True
-
-    return False
-
-
 def _rank_quest(
     quest: Quest,
     *,
@@ -299,38 +325,15 @@ def _rank_quest(
     profile_data: dict,
     history: list[QuestHistory],
 ) -> float:
-    """
-    Deterministically rank a safe candidate.
-
-    Recent categories receive a small penalty rather than being rejected.
-    This encourages variety while still allowing a good quest to be selected.
-    """
-    time_fit = _time_score(
-        quest.duration_minutes,
-        time_available,
-    )
-
-    preference = _preference_score(
-        quest,
-        profile_data,
-        interests,
-    )
-
+    time_fit = _time_score(quest.duration_minutes, time_available)
+    preference = _preference_score(quest, profile_data, interests)
     novelty = quest.novelty_score
-
-    feasibility = (
-        1.0
-        if quest.duration_minutes <= time_available
-        else 0.0
-    )
-
-    # Route awareness is not implemented yet, so keep a neutral value.
+    feasibility = 1.0 if quest.duration_minutes <= time_available else 0.0
     route_compatibility = 0.5
+    historical_success = _historical_success(quest, history)
 
-    historical_success = _historical_success(
-        quest,
-        history,
-    )
+    recent_categories = [record.category for record in history[:3]]
+    category_recency_penalty = 0.08 if quest.category in recent_categories else 0.0
 
     score = (
         0.25 * time_fit
@@ -341,23 +344,23 @@ def _rank_quest(
         + 0.10 * historical_success
     )
 
-    # Encourage category diversity without blocking valid quests.
-    recent_categories = [
-        record.category.lower()
-        for record in history[:3]
-    ]
+    if _is_repetitive_score(db=None, quest=quest):
+        score -= 0.15
 
-    if quest.category.lower() in recent_categories:
-        score -= 0.08
+    score -= category_recency_penalty
 
-    return max(
-        0.0,
-        min(1.0, score),
-    )
+    return max(0.0, min(1.0, score))
+
+
+def _is_repetitive_score(db, quest: Quest) -> bool:
+    # Placeholder used only to keep ranking deterministic; actual repetition is
+    # checked against the database before selection.
+    return False
 
 
 async def _generate_candidates(
     db: Session,
+    client_id: str,
     *,
     destination: str,
     time_available: int,
@@ -366,9 +369,8 @@ async def _generate_candidates(
     count: int,
     chaos: bool = False,
 ) -> list[tuple[Quest, float]]:
-    profile = _profile(db)
-    profile_data = _profile_data(profile)
-    history = _recent_history(db, 10)
+    profile_data = _profile_data(db, client_id)
+    history = _recent_history(db, client_id, 10)
     results: list[tuple[Quest, float]] = []
 
     for index in range(count):
@@ -404,7 +406,7 @@ async def _generate_candidates(
         if quest.duration_minutes > time_available:
             continue
 
-        if _is_repetitive(db, quest):
+        if _is_repetitive(db, client_id, quest):
             continue
 
         score = _rank_quest(
@@ -443,6 +445,7 @@ def _history_dict(record: QuestHistory) -> dict:
 
 def _save_quest(
     db: Session,
+    client_id: str,
     *,
     request_destination: str,
     time_available: int,
@@ -471,12 +474,22 @@ def _save_quest(
     db.add(history)
     db.commit()
     db.refresh(history)
+
+    user = _ensure_user(db, client_id)
+    db.execute(
+        text(
+            "INSERT INTO sidequest_user_quests (user_id, quest_id) "
+            "VALUES (:user_id, :quest_id)"
+        ),
+        {"user_id": user["id"], "quest_id": history.id},
+    )
+    db.commit()
     return history
 
 
-def _update_profile(db: Session, record: QuestHistory) -> None:
-    profile = _profile(db)
-    preferences = _loads(profile.category_preferences, {})
+def _update_profile(db: Session, client_id: str, record: QuestHistory) -> None:
+    user = _ensure_user(db, client_id)
+    preferences = _loads(user["category_preferences"], {})
     category = record.category
     current = float(preferences.get(category, 0.5))
 
@@ -491,23 +504,38 @@ def _update_profile(db: Session, record: QuestHistory) -> None:
 
     preferences[category] = max(0.05, min(0.95, current + reward))
 
-    completed = max(
-        0,
-        db.query(func.count(QuestHistory.id))
-        .filter(QuestHistory.status == "completed")
-        .scalar()
-        or 0,
-    )
+    owned_completed = db.execute(
+        text(
+            "SELECT COUNT(*) FROM sidequest_user_quests uq "
+            "JOIN quest_history qh ON qh.id = uq.quest_id "
+            "WHERE uq.user_id = :user_id AND qh.status = 'completed'"
+        ),
+        {"user_id": user["id"]},
+    ).scalar() or 0
 
     if record.status == "completed":
-        # Lightweight duration adaptation after successful completion.
-        old_duration = float(profile.preferred_duration or 20)
-        profile.preferred_duration = int(round(old_duration * 0.8 + record.duration_minutes * 0.2))
+        old_duration = float(user["preferred_duration"] or 20)
+        preferred_duration = int(round(
+            old_duration * 0.8 + record.duration_minutes * 0.2
+        ))
+    else:
+        preferred_duration = user["preferred_duration"]
 
-    if completed == 0:
-        profile.novelty_preference = 0.7
+    novelty = 0.7 if owned_completed == 0 else user["novelty_preference"]
 
-    profile.category_preferences = _dumps(preferences)
+    db.execute(
+        text(
+            "UPDATE sidequest_users SET category_preferences = :prefs, "
+            "preferred_duration = :duration, novelty_preference = :novelty "
+            "WHERE id = :user_id"
+        ),
+        {
+            "prefs": _dumps(preferences),
+            "duration": preferred_duration,
+            "novelty": novelty,
+            "user_id": user["id"],
+        },
+    )
     db.commit()
 
 
@@ -540,10 +568,12 @@ def health():
 
 
 @app.post("/generate-quest")
-async def create_quest(request: QuestRequest, db: Session = Depends(get_db)):
+async def create_quest(request: QuestRequest, db: Session = Depends(get_db), client_header: str | None = Header(default=None, alias="X-SIDEQUEST-CLIENT-ID")):
+    client_id = _client_id(client_header)
     try:
         candidates = await _generate_candidates(
             db,
+            client_id,
             destination=request.destination,
             time_available=request.time_available,
             mood=request.mood,
@@ -562,6 +592,7 @@ async def create_quest(request: QuestRequest, db: Session = Depends(get_db)):
         selected, selected_score = max(candidates, key=lambda item: item[1])
         history = _save_quest(
             db,
+            client_id,
             request_destination=request.destination,
             time_available=request.time_available,
             mood=request.mood,
@@ -586,10 +617,12 @@ async def create_quest(request: QuestRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/generate-candidates")
-async def create_candidates(request: QuestRequest, db: Session = Depends(get_db)):
+async def create_candidates(request: QuestRequest, db: Session = Depends(get_db), client_header: str | None = Header(default=None, alias="X-SIDEQUEST-CLIENT-ID")):
+    client_id = _client_id(client_header)
     try:
         candidates = await _generate_candidates(
             db,
+            client_id,
             destination=request.destination,
             time_available=request.time_available,
             mood=request.mood,
@@ -611,8 +644,9 @@ async def create_candidates(request: QuestRequest, db: Session = Depends(get_db)
 
 
 @app.get("/quests")
-def list_quests(db: Session = Depends(get_db)):
-    records = _recent_history(db, 100)
+def list_quests(db: Session = Depends(get_db), client_header: str | None = Header(default=None, alias="X-SIDEQUEST-CLIENT-ID")):
+    client_id = _client_id(client_header)
+    records = _recent_history(db, client_id, 100)
     return [_history_dict(record) for record in records]
 
 
@@ -621,9 +655,22 @@ def quest_feedback(
     quest_id: int,
     feedback: QuestFeedback,
     db: Session = Depends(get_db),
+    client_header: str | None = Header(default=None, alias="X-SIDEQUEST-CLIENT-ID"),
 ):
+    client_id = _client_id(client_header)
     record = db.get(QuestHistory, quest_id)
     if record is None:
+        return {"error": "Quest not found."}
+
+    owned = db.execute(
+        text(
+            "SELECT 1 FROM sidequest_user_quests uq "
+            "JOIN sidequest_users u ON u.id = uq.user_id "
+            "WHERE uq.quest_id = :quest_id AND u.client_id = :client_id"
+        ),
+        {"quest_id": quest_id, "client_id": client_id},
+    ).first()
+    if owned is None:
         return {"error": "Quest not found."}
 
     record.status = feedback.status
@@ -631,7 +678,7 @@ def quest_feedback(
     record.reflection = feedback.reflection
     db.commit()
     db.refresh(record)
-    _update_profile(db, record)
+    _update_profile(db, client_id, record)
 
     return {
         "message": "Feedback saved. Your future sidequests will adapt.",
@@ -640,28 +687,43 @@ def quest_feedback(
 
 
 @app.get("/profile")
-def profile_endpoint(db: Session = Depends(get_db)):
-    return _profile_data(_profile(db))
+def profile_endpoint(db: Session = Depends(get_db), client_header: str | None = Header(default=None, alias="X-SIDEQUEST-CLIENT-ID")):
+    client_id = _client_id(client_header)
+    return _profile_data(db, client_id)
 
 
 @app.get("/stats")
-def stats(db: Session = Depends(get_db)):
+def stats(
+    db: Session = Depends(get_db),
+    client_header: str | None = Header(default=None, alias="X-SIDEQUEST-CLIENT-ID"),
+):
+    client_id = _client_id(client_header)
+    user = _ensure_user(db, client_id)
+
+    owned_ids = db.execute(
+        text("SELECT quest_id FROM sidequest_user_quests WHERE user_id = :user_id"),
+        {"user_id": user["id"]},
+    ).scalars().all()
+    scoped_ids = list(owned_ids) or [-1]
+
     completed = (
         db.query(func.count(QuestHistory.id))
         .filter(QuestHistory.status == "completed")
+        .filter(QuestHistory.id.in_(scoped_ids))
         .scalar()
         or 0
     )
     minutes = (
         db.query(func.coalesce(func.sum(QuestHistory.duration_minutes), 0))
         .filter(QuestHistory.status == "completed")
+        .filter(QuestHistory.id.in_(scoped_ids))
         .scalar()
         or 0
     )
-    attempted = db.query(func.count(QuestHistory.id)).scalar() or 0
     categories = (
         db.query(QuestHistory.category)
         .filter(QuestHistory.status == "completed")
+        .filter(QuestHistory.id.in_(scoped_ids))
         .distinct()
         .count()
     )
@@ -669,16 +731,18 @@ def stats(db: Session = Depends(get_db)):
     return {
         "sidequests_completed": int(completed),
         "minutes_explored": int(minutes),
-        "quests_attempted": int(attempted),
+        "quests_attempted": len(owned_ids),
         "categories_explored": int(categories),
     }
 
 
 @app.post("/chaos-quest")
-async def chaos_quest(request: ChaosRequest, db: Session = Depends(get_db)):
+async def chaos_quest(request: ChaosRequest, db: Session = Depends(get_db), client_header: str | None = Header(default=None, alias="X-SIDEQUEST-CLIENT-ID")):
+    client_id = _client_id(client_header)
     try:
         candidates = await _generate_candidates(
             db,
+            client_id,
             destination="somewhere nearby",
             time_available=request.time_available,
             mood="curious",
@@ -696,6 +760,7 @@ async def chaos_quest(request: ChaosRequest, db: Session = Depends(get_db)):
         )
         history = _save_quest(
             db,
+            client_id,
             request_destination="Chaos Mode",
             time_available=request.time_available,
             mood="curious",
@@ -719,8 +784,9 @@ async def chaos_quest(request: ChaosRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/check-repetition")
-def check_quest_repetition(quest: Quest, db: Session = Depends(get_db)):
-    repeated = _is_repetitive(db, quest)
+def check_quest_repetition(quest: Quest, db: Session = Depends(get_db), client_header: str | None = Header(default=None, alias="X-SIDEQUEST-CLIENT-ID")):
+    client_id = _client_id(client_header)
+    repeated = _is_repetitive(db, client_id, quest)
     return {
         "repeated": repeated,
         "safe_to_use": not repeated,
